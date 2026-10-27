@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import abc
+import contextlib
 import logging
 import os
 import signal
@@ -32,8 +33,29 @@ def _extract_stderr_details(stderr_file, max_lines=0):
     return result
 
 
+def _extract_stderr_tail(stderr_file, max_lines=0):
+    if max_lines <= 0 or stderr_file is None:
+        return []
+
+    blocks = []
+    newline_count = 0
+    with open(stderr_file, 'rb') as log:
+        log.seek(0, os.SEEK_END)
+        position = log.tell()
+        while position > 0 and newline_count <= max_lines:
+            size = min(position, 8192)
+            position -= size
+            log.seek(position)
+            block = log.read(size)
+            blocks.append(block)
+            newline_count += block.count(b'\n')
+    lines = b''.join(reversed(blocks)).splitlines()[-max_lines:]
+    return ["Stderr tail:", ""] + [line.decode('utf-8', errors='replace') for line in lines]
+
+
 class DaemonError(RuntimeError):
-    def __init__(self, message, stdout, stderr, exit_code, max_stderr_lines=0):
+    def __init__(self, message, stdout, stderr, exit_code, max_stderr_lines=0, stderr_tail=False):
+        extract_stderr = _extract_stderr_tail if stderr_tail else _extract_stderr_details
         super(DaemonError, self).__init__(
             '\n'.join(
                 [
@@ -42,7 +64,7 @@ class DaemonError(RuntimeError):
                     "Stdout file name: \n{}".format(stdout if stdout is not None else "is not present."),
                     "Stderr file name: \n{}".format(stderr if stderr is not None else "is not present."),
                 ]
-                + _extract_stderr_details(stderr, max_stderr_lines)
+                + extract_stderr(stderr, max_stderr_lines)
             )
         )
 
@@ -64,11 +86,13 @@ class Daemon(object):
         aux_file=None,
         stderr_on_error_lines=0,
         core_pattern=None,
+        stderr_tail=False,
     ):
         self.__cwd = cwd
         self.__timeout = timeout
         self.__command = tuple(command)
         self.__stderr_on_error_lines = stderr_on_error_lines
+        self.__stderr_tail = stderr_tail
         self.__daemon = None
         self.killed = False
         self.__core_pattern = core_pattern
@@ -79,6 +103,45 @@ class Daemon(object):
         self.__stdout_file = None
         self.__stderr_file = None
         self.__aux_file = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is not None:
+                if self.__daemon is not None:
+                    try:
+                        self.__daemon.terminate()
+                        self.__daemon.wait(check_exit_code=False, timeout=min(self.__timeout, 10))
+                    except BaseException:
+                        self.logger.exception("Daemon cleanup or diagnostics failed")
+                        try:
+                            self.__daemon.verify_sanitize_errors()
+                        except BaseException:
+                            self.logger.exception("Daemon sanitizer diagnostics failed")
+                try:
+                    self.logger.error("%s", self.failure(str(exc_value)))
+                except BaseException:
+                    self.logger.exception("Could not read daemon failure details")
+        finally:
+            try:
+                self.__close_output_files()
+            except BaseException:
+                if exc_type is None:
+                    raise
+                self.logger.exception("Could not close daemon output files")
+        return False
+
+    def failure(self, message):
+        return DaemonError(
+            message,
+            stdout=self.stdout_file_name,
+            stderr=self.stderr_file_name,
+            exit_code=self.__daemon.exit_code if self.__daemon is not None else None,
+            max_stderr_lines=self.__stderr_on_error_lines if os.path.exists(self.stderr_file_name) else 0,
+            stderr_tail=self.__stderr_tail,
+        )
 
     def update_command(self, new_command):
         new_command_tuple = tuple(new_command)
@@ -93,10 +156,15 @@ class Daemon(object):
             self.__aux_file = open(self.__aux_file_name, mode='w+b')
 
     def __open_output_files(self):
-        self.__stdout_file = open(self.__stdout_file_name, mode='ab')
-        self.__stderr_file = open(self.__stderr_file_name, mode='ab')
-        if self.__aux_file_name is not None:
-            self.__aux_file = open(self.__aux_file_name, mode='w+b')
+        self.__close_output_files()
+        with contextlib.ExitStack() as files:
+            stdout = files.enter_context(open(self.__stdout_file_name, mode='ab'))
+            stderr = files.enter_context(open(self.__stderr_file_name, mode='ab'))
+            aux = files.enter_context(open(self.__aux_file_name, mode='w+b')) if self.__aux_file_name is not None else None
+            files.pop_all()
+        self.__stdout_file = stdout
+        self.__stderr_file = stderr
+        self.__aux_file = aux
 
     def __close_output_files(self):
         if self.__stdout_file is not None:
@@ -136,27 +204,25 @@ class Daemon(object):
         if self.is_alive():
             return
         self.__open_output_files()
-        self.__daemon = process.execute(
-            self.__command,
-            check_exit_code=False,
-            cwd=self.__cwd,
-            stdout=self.__stdout_file,
-            stderr=self.__stderr_file,
-            wait=False,
-            core_pattern=self.__core_pattern,
-        )
+        try:
+            self.__daemon = process.execute(
+                self.__command,
+                check_exit_code=False,
+                cwd=self.__cwd,
+                stdout=self.__stdout_file,
+                stderr=self.__stderr_file,
+                wait=False,
+                core_pattern=self.__core_pattern,
+            )
+        except BaseException:
+            self.__close_output_files()
+            raise
         wait_for(self.is_alive, self.__timeout)
 
         if not self.is_alive():
             self.__check_before_fail()
             self.__close_output_files()
-            raise DaemonError(
-                "Unexpectedly finished on start",
-                exit_code=self.__daemon.exit_code,
-                stdout=self.stdout_file_name,
-                stderr=self.stderr_file_name,
-                max_stderr_lines=self.__stderr_on_error_lines,
-            )
+            raise self.failure("Unexpectedly finished on start")
 
         self.killed = False
 
@@ -180,13 +246,7 @@ class Daemon(object):
         if not self.is_alive():
             self.__check_before_fail()
             self.__close_output_files()
-            raise DaemonError(
-                "Unexpectedly finished before %s" % stop_type,
-                exit_code=self.__daemon.exit_code,
-                stdout=self.stdout_file_name,
-                stderr=self.stderr_file_name,
-                max_stderr_lines=self.__stderr_on_error_lines,
-            )
+            raise self.failure("Unexpectedly finished before %s" % stop_type)
 
         return True
 
@@ -194,13 +254,7 @@ class Daemon(object):
         if self.is_alive():
             msg = "Cannot {stop_type} daemon cmd = {cmd}".format(cmd=' '.join(self.__command), stop_type=stop_type)
             self.logger.error(msg)
-            raise DaemonError(
-                msg,
-                exit_code=self.__daemon.exit_code,
-                stdout=self.stdout_file_name,
-                stderr=self.stderr_file_name,
-                max_stderr_lines=self.__stderr_on_error_lines,
-            )
+            raise self.failure(msg)
 
     def stop(self):
         if not self.__check_can_launch_stop("stop"):
@@ -226,13 +280,7 @@ class Daemon(object):
             self.__check_before_fail()
 
             if exit_code not in self._acceptable_exit_codes:
-                raise DaemonError(
-                    "Bad exit_code.",
-                    exit_code=exit_code,
-                    stdout=self.stdout_file_name,
-                    stderr=self.stderr_file_name,
-                    max_stderr_lines=self.__stderr_on_error_lines,
-                )
+                raise self.failure("Bad exit_code.")
         else:
             self.logger.warning("Exit code is not checked, cos binary was stopped by sigkill")
 
